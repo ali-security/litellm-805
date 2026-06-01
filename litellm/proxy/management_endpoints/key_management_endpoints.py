@@ -396,6 +396,42 @@ def handle_key_type(data: GenerateKeyRequest, data_json: dict) -> dict:
     return data_json
 
 
+_NON_ADMIN_SAFE_ALLOWED_ROUTES_PRESETS = frozenset({"llm_api_routes", "info_routes"})
+
+
+def _check_allowed_routes_caller_permission(
+    allowed_routes: Optional[list],
+    user_api_key_dict: UserAPIKeyAuth,
+    *,
+    allow_safe_presets: bool = False,
+) -> None:
+    """
+    Only proxy admins may set `allowed_routes` on a key.
+
+    `allowed_routes` bypasses the standard role-based route gate in
+    RouteChecks.non_proxy_admin_allowed_routes_check, so if a non-admin is
+    allowed to set it they can grant themselves access to any endpoint.
+    Non-admins should use `key_type` to pick a preset route bucket instead.
+    """
+    if not allowed_routes:
+        return
+    if user_api_key_dict.user_role == LitellmUserRoles.PROXY_ADMIN.value:
+        return
+    if allow_safe_presets and all(
+        r in _NON_ADMIN_SAFE_ALLOWED_ROUTES_PRESETS for r in allowed_routes
+    ):
+        return
+    raise HTTPException(
+        status_code=403,
+        detail={
+            "error": (
+                "Only proxy admins can set `allowed_routes` on a key. "
+                "Use `key_type` to pick a preset route bucket instead."
+            )
+        },
+    )
+
+
 async def validate_team_id_used_in_service_account_request(
     team_id: Optional[str],
     prisma_client: Optional[PrismaClient],
@@ -572,6 +608,12 @@ async def _common_key_generation_helper(  # noqa: PLR0915
     data_json = data.model_dump(exclude_unset=True, exclude_none=True)  # type: ignore
 
     data_json = handle_key_type(data, data_json)
+
+    _check_allowed_routes_caller_permission(
+        allowed_routes=data_json.get("allowed_routes"),
+        user_api_key_dict=user_api_key_dict,
+        allow_safe_presets=True,
+    )
 
     # if we get max_budget passed to /key/generate, then use it as key_max_budget. Since generate_key_helper_fn is used to make new users
     if "max_budget" in data_json:
@@ -1098,6 +1140,11 @@ async def generate_key_fn(
             route=KeyManagementRoutes.KEY_GENERATE,
         )
 
+        _check_allowed_routes_caller_permission(
+            allowed_routes=data.allowed_routes,
+            user_api_key_dict=user_api_key_dict,
+        )
+
         if team_table is not None:
             await _check_team_key_limits(
                 team_table=team_table,
@@ -1209,6 +1256,11 @@ async def generate_service_account_key_fn(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail={"error": CommonProxyErrors.db_not_connected_error.value},
         )
+
+    _check_allowed_routes_caller_permission(
+        allowed_routes=data.allowed_routes,
+        user_api_key_dict=user_api_key_dict,
+    )
 
     await validate_team_id_used_in_service_account_request(
         team_id=data.team_id,
@@ -1511,6 +1563,11 @@ async def update_key_fn(
                 status_code=404,
                 detail={"error": f"Team not found, passed team_id={data.team_id}"},
             )
+
+        _check_allowed_routes_caller_permission(
+            allowed_routes=data.allowed_routes,
+            user_api_key_dict=user_api_key_dict,
+        )
 
         ## sanity check - prevent non-proxy admin user from updating key to belong to a different user
         if (
@@ -2788,6 +2845,12 @@ async def regenerate_key_fn(
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail={"error": "You are not authorized to regenerate this key"},
+            )
+
+        if data is not None:
+            _check_allowed_routes_caller_permission(
+                allowed_routes=data.allowed_routes,
+                user_api_key_dict=user_api_key_dict,
             )
 
         verbose_proxy_logger.debug("key_in_db: %s", _key_in_db)
